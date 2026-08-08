@@ -1,0 +1,17 @@
+{
+  "index_patterns": ["bank-transactions-alerts-*"],
+  "template": {
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "@timestamp":   { "type": "date" },
+        "rule_name":    { "type": "keyword" },
+        "rule_id":      { "type": "keyword" },
+        "count":        { "type": "integer" },
+        "threshold":    { "type": "integer" },
+        "window":       { "type": "keyword" },
+        "message":      { "type": "text" }
+      }
+    }
+  }
+}

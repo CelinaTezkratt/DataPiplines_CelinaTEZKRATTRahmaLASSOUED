@@ -1,0 +1,22 @@
+{
+  "index_patterns": ["bank-transactions-txn-*"],
+  "template": {
+    "mappings": {
+      "dynamic": false,
+      "properties": {
+        "@timestamp":   { "type": "date" },
+        "ev":           { "type": "keyword" },
+        "id":           { "type": "keyword" },
+        "amount":       { "type": "float" },
+        "currency":     { "type": "keyword" },
+        "country_code": { "type": "keyword" },
+        "card_present": { "type": "boolean" },
+        "merchant":     { "type": "keyword" },
+        "status":       { "type": "keyword" },
+        "reason":       { "type": "keyword" },
+        "message":      { "type": "text" },
+        "tags":         { "type": "keyword" }
+      }
+    }
+  }
+}

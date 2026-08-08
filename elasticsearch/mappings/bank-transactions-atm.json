@@ -1,0 +1,18 @@
+{
+  "index_patterns": ["bank-transactions-atm-*"],
+  "template": {
+    "mappings": {
+      "dynamic": false,
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "atm_id":     { "type": "keyword" },
+        "city":       { "type": "keyword" },
+        "op":         { "type": "keyword" },
+        "amount":     { "type": "float" },
+        "result":     { "type": "keyword" },
+        "message":    { "type": "text" },
+        "tags":       { "type": "keyword" }
+      }
+    }
+  }
+}

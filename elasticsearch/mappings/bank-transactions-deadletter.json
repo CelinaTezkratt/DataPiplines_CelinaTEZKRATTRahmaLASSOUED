@@ -1,0 +1,15 @@
+{
+  "index_patterns": ["bank-transactions-deadletter-*"],
+  "template": {
+    "mappings": {
+      "dynamic": false,
+      "properties": {
+        "@timestamp":        { "type": "date" },
+        "message":           { "type": "text" },
+        "tags":              { "type": "keyword" },
+        "dead_letter_reason":{ "type": "keyword" },
+        "path":              { "type": "keyword" }
+      }
+    }
+  }
+}

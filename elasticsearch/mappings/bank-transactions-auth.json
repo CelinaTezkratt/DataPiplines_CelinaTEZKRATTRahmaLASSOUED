@@ -1,0 +1,31 @@
+{
+  "index_patterns": ["bank-transactions-auth-*"],
+  "template": {
+    "mappings": {
+      "dynamic": false,
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "event":      { "type": "keyword" },
+        "user":       { "type": "keyword" },
+        "channel":    { "type": "keyword" },
+        "result":     { "type": "keyword" },
+        "ip":         { "type": "ip" },
+        "geoip": {
+          "properties": {
+            "ip":           { "type": "ip" },
+            "country_name": { "type": "keyword" },
+            "country_code2":{ "type": "keyword" },
+            "city_name":    { "type": "keyword" },
+            "location":     { "type": "geo_point" },
+            "continent_code": { "type": "keyword" },
+            "region_name":  { "type": "keyword" },
+            "region_code":  { "type": "keyword" },
+            "timezone":     { "type": "keyword" }
+          }
+        },
+        "message": { "type": "text" },
+        "tags":    { "type": "keyword" }
+      }
+    }
+  }
+}

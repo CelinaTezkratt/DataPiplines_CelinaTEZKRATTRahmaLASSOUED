@@ -1,0 +1,58 @@
+version: "3.8"
+
+# Stack ELK complète pour le projet "Meridian Pay" (bank-transactions).
+# Sécurité X-Pack désactivée volontairement (choix documenté dans le README :
+# on privilégie la simplicité de reproduction sur un environnement de cours).
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: es-bank
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks: [elk]
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: kibana-bank
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=b3a7615d96d36cb3b67db4e91f6b3cc1
+    ports:
+      - "5601:5601"
+    networks: [elk]
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.15.0
+    container_name: logstash-bank
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./kits/bank-transactions/logs:/logs:ro
+    environment:
+      - LS_JAVA_OPTS=-Xms512m -Xmx512m
+    networks: [elk]
+
+volumes:
+  esdata:
+
+networks:
+  elk:
+    driver: bridge
