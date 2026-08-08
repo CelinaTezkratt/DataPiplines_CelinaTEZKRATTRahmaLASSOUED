@@ -1,15 +1,21 @@
-# Team <nom> — Kit: Bank Transactions ("Meridian Pay")
+# Team — Kit: Bank Transactions ("Meridian Pay")
+
+Pipeline ELK complet (Elasticsearch, Logstash, Kibana) pour le processeur de
+paiement fictif **Meridian Pay** : ingestion de 3 sources hétérogènes,
+stockage avec mappings explicites, dashboard répondant à 8 questions métier,
+et alerte temps réel sur un burst de fraude.
+
 
 ## 1. Architecture
 
 ```
-generator (Python, fourni)
+générateur Python (fourni)
         │  écrit
         ▼
 kits/bank-transactions/logs/{transactions.log, auth.log, atm.csv}
-        │  lus par Logstash (file input)
+        │  lus par Logstash (file input, un input par source)
         ▼
-Logstash  ── parse (kv / json / csv) ── type ── enrichit (geoip) ── route
+Logstash — parse (kv / json / csv) — type — enrichit (geoip) — route
         │                                                    │
         ▼ (lignes valides)                                   ▼ (lignes malformées)
 Elasticsearch                                        Elasticsearch
@@ -18,99 +24,191 @@ Elasticsearch                                        Elasticsearch
   bank-transactions-atm-*
         │
         ▼
-Kibana — dashboard (8 questions) + règle d'alerte → bank-transactions-alerts-*
+Kibana — dashboard (8 questions) + règle d'alerte → bank-transactions-alerts
 ```
 
-*(remplace ce schéma ASCII par une vraie image si tu veux, ex. excalidraw/draw.io exportée en PNG dans `docs/architecture.png`)*
+La stack est entièrement conteneurisée (Docker Compose) : Elasticsearch 8.15,
+Kibana 8.15, Logstash 8.15, un réseau Docker, un volume persistant pour les
+données Elasticsearch.
 
-## 2. Comment lancer le projet (2 commandes max)
+## 2. Comment lancer le projet
+
+Deux commandes suffisent sur une machine avec Docker installé :
 
 ```bash
 docker compose up -d
-./scripts/seed.sh 5000        # applique les mappings + génère 5000 événements déterministes
+./scripts/seed.sh 5000
 ```
+
+`seed.sh` attend qu'Elasticsearch soit prêt, applique les 5 index templates
+(mappings explicites), puis lance le générateur en mode batch déterministe
+(5000 événements). Logstash, déjà démarré, ingère alors automatiquement les
+fichiers produits.
 
 Vérifier que tout est monté :
 ```bash
-curl -s http://localhost:9200/_cat/indices/bank-transactions-*?v
+curl -s 'http://localhost:9200/_cat/indices/bank-transactions-*?v'
+```
+
+Vérifier le critère d'acceptation (zéro perte) :
+```bash
+./scripts/verify_count.sh
 ```
 
 Kibana : http://localhost:5601
 
-Pour rejouer une anomalie en direct pendant la démo (mode continu, ~20 ev/s) :
+Pour démontrer l'alerte en direct (mode continu, horodatage réel,
+~20 événements/s) :
 ```bash
-python3 kits/bank-transactions/generator/generate.py
+py kits/bank-transactions/generator/generate.py
 ```
-(laisser tourner ~1000 événements pour retraverser la fenêtre d'anomalie, `Ctrl-C` pour arrêter)
+Laisser tourner 2-3 minutes pour que l'anomalie périodique repasse plusieurs
+fois et dépasse le seuil de l'alerte, `Ctrl-C` pour arrêter.
 
-## 3. Choix & compromis
+## 3. Ce qui a cassé, et comment on l'a corrigé
 
-> À compléter au fur et à mesure de votre travail — c'est la section où se cachent
-> le plus de points. Quelques pistes déjà tranchées dans ce squelette, à
-> documenter/justifier avec vos propres mots :
+Le premier passage du pipeline a échoué : sur un batch de 5000 transactions,
+2140 sont parties en dead-letter à tort et aucun document n'atteignait les
+index métier. Trois bugs distincts, empilés :
 
+1. **Fins de ligne Windows (`\r`)** — le générateur, exécuté sous Windows,
+   écrit ses fichiers en mode texte ; Python y traduit chaque `\n` en `\r\n`.
+   Corrigé par un `mutate/gsub` en tout début de pipeline.
+2. **Conflit `dynamic: strict` vs métadonnées automatiques de Logstash** — le
+   `file input` de Logstash ajoute automatiquement un champ `event.original`
+   (comportement ECS par défaut). En mapping strict, Elasticsearch rejetait
+   silencieusement tout document contenant ce champ imprévu, y compris des
+   transactions parfaitement valides. Corrigé en retirant le champ `event` et
+   en passant les mappings métier de `strict` à `false`.
+3. **Piège de vérité Logstash sur la chaîne `"false"`** — le test
+   `![card_present]` traite la chaîne littérale `"false"` comme fausse (donc
+   "champ absent"), même quand le champ existe. ~40% des transactions (dont
+   toutes les transactions frauduleuses) étaient marquées à tort comme
+   incomplètes. Corrigé en retirant `card_present` de la vérification des
+   champs obligatoires.
+
+Résultat après correction, sur le même batch de 5000 transactions :
+
+```
+transactions.log : indexé=4888  lignes_fichier=5000
+auth.log         : indexé=2960  lignes_fichier=3017
+atm.csv          : indexé=754   lignes_fichier=754
+dead-letter total : 169
+---
+Somme indexé (txn+auth+atm) + dead-letter = 8771
+Somme lignes générées (hors en-tête csv)   = 8771
+```
+
+`169 / 8771 ≈ 1.9%`, cohérent avec le taux de ~2% de lignes volontairement
+malformées annoncé par le kit. Critère d'acceptation validé à l'exact.
+
+## 4. Choix & compromis
+
+- **Un index par source (`index layout`)** : `bank-transactions-txn-*`,
+  `-auth-*`, `-atm-*`, `-deadletter-*` et `-alerts` sont volontairement
+  séparés plutôt qu'un index commun. Les trois sources métier (transactions,
+  authentification, ATM) ont des **schémas et des cardinalités de requêtes
+  différents** (ex. `card_present` n'a aucun sens pour un événement ATM,
+  `rssi` n'existerait pas côté transactions) : les séparer permet un mapping
+  explicite et adapté à chaque type d'événement, sans conflit de type entre
+  sources (ex. un champ `amount` en `float` côté transactions vs un `amount`
+  qui pourrait avoir une autre sémantique ailleurs). L'index dead-letter est
+  isolé pour ne jamais polluer les index métier avec des documents partiels,
+  et l'index alerts est isolé car il a un cycle de vie et une audience
+  différents (audit/monitoring plutôt qu'analyse business).
 - **`kv` plutôt que `grok`** pour `transactions.log` : le format `clé=valeur`
   s'y prête nativement, plus lisible et plus robuste aux réordonnancements de
-  champs qu'un grok pattern positionnel.
+  champs qu'un pattern grok positionnel.
 - **Détection de dead-letter explicite** plutôt que de se fier uniquement aux
-  tags `_grokparsefailure`/`_jsonparsefailure` : `kv` ne "plante" jamais, il
-  faut donc vérifier nous-mêmes la présence des champs obligatoires.
-- **`dynamic: strict`** sur les index métier : toute dérive de schéma fait
-  échouer l'indexation plutôt que de la laisser passer silencieusement.
+  tags automatiques (`_jsonparsefailure`, etc.) : `kv` ne "plante" jamais
+  formellement, il faut donc vérifier soi-même la présence des champs
+  obligatoires après coup.
+- **`dynamic: false` plutôt que `dynamic: strict`** sur les index métier :
+  garde des types stricts sur les champs qu'on connaît, sans faire échouer
+  tout un document à cause d'un champ de métadonnées imprévu injecté par le
+  framework (voir bug #2 ci-dessus).
 - **Sécurité X-Pack désactivée** : simplifie la reproduction sur une machine
-  de cours ; à mentionner comme trade-off assumé (pas de prod réelle).
+  de cours ; trade-off assumé, non représentatif d'un vrai environnement de
+  production.
 - **`sincedb_path => /dev/null`** : permet de rejouer les fichiers à chaque
-  redémarrage de Logstash, pratique pour la démo déterministe ; en
-  "vraie" prod on utiliserait un sincedb persistant.
-- Seuil d'alerte : 20 déclins CNP en 5 min (imposé par l'énoncé) — noter la
-  fenêtre Kibana Alerting choisie (`check every` vs `look back window`) et
-  pourquoi.
+  redémarrage de Logstash, pratique pour une démo déterministe ; en
+  production on utiliserait un sincedb persistant.
+- **`geoip`** appliqué uniquement sur `auth.log` (champ `ip`) en mode
+  `ecs_compatibility: disabled`, pour obtenir des noms de champs stables
+  (`country_name`, `location`…) compatibles avec un mapping explicite en
+  `geo_point`.
+- **Seuil d'alerte** : > 20 transactions déclinées en card-not-present sur
+  une fenêtre glissante de 5 minutes (imposé par l'énoncé du kit), évaluée
+  toutes les minutes.
 
-## 4. Réponses aux 8 questions (mapping question → panel du dashboard)
+## 5. Réponses aux 8 questions
 
-| # | Question | Panel Kibana | Index / champs clés |
+| # | Question | Panel Kibana | Source / champs clés |
 |---|----------|--------------|----------------------|
-| 1 | Volume & valeur par devise dans le temps | ... | `bank-transactions-txn-*` : `amount`, `currency`, `@timestamp` |
-| 2 | Taux d'approbation dans le temps | ... | `status` |
-| 3 | Top 10 marchands par valeur | ... | `merchant`, `amount` |
-| 4 | Top motifs de refus | ... | `reason` |
-| 5 | Card-present vs CNP par pays | ... | `card_present`, `country_code` |
-| 6 | Villes ATM / taux d'erreur | ... | `bank-transactions-atm-*` : `city`, `result` |
-| 7 | Signature de l'attaque fraude | ... | `txn` + `auth` (geoip) croisés |
-| 8 | Part de lignes dead-letter | ... | ratio `deadletter` / total |
+| 1 | Volume & valeur par devise dans le temps | Volume & valeur par devise | txn : `amount`, `currency`, `@timestamp` |
+| 2 | Taux d'approbation dans le temps | Taux d'approbation dans le temps | txn : `status` (formule KQL) |
+| 3 | Top 10 marchands par valeur | Top 10 marchands par valeur | txn : `merchant`, `amount` |
+| 4 | Top motifs de refus | Top motifs de refus | txn : `reason` (filtre `status:declined`) |
+| 5 | Card-present vs CNP par pays | Card-present vs CNP par pays | txn : `card_present`, `country_code` |
+| 6 | Villes ATM / taux d'erreur | Villes ATM (cash) + Taux d'erreur ATM | atm : `city`, `op`, `result` |
+| 7 | Signature de l'attaque fraude | Déclins CNP dans le temps par pays + Carte des échecs d'auth | txn + auth (geoip) croisés |
+| 8 | Part de lignes dead-letter | Part de lignes dead-letter (%) | tous index : `tags:_dead_letter` |
 
-*(remplace `...` par le nom réel du panel une fois le dashboard construit)*
+Détail de la question 7 (signature de la fraude) et captures d'écran : voir
+le rapport PDF.
 
-## 5. Alerte
+## 6. Mapping des champs (index `bank-transactions-txn-*`)
 
-- **Type** : Kibana Alerting — règle "Elasticsearch query" (threshold).
-- **Condition** : nombre de documents `bank-transactions-txn-*` où
-  `status: declined AND card_present: false` > 20 sur une fenêtre glissante
-  de 5 minutes.
-- **Action** : connecteur "Index" → écrit dans `bank-transactions-alerts-*`.
-- **Preuve de déclenchement** : capture d'écran dans `docs/alert-firing.png`
-  + démonstration live à la soutenance (relancer le générateur en continu
-  jusqu'à retraverser la fenêtre d'anomalie ~55–70% du batch).
+Extrait des choix de type les plus significatifs — le détail complet est dans
+`elasticsearch/mappings/*.json` (un fichier par index, appliqué comme index
+template au démarrage).
 
-## 6. Structure du dépôt
+| Champ | Type | Pourquoi |
+|-------|------|----------|
+|`amount`| `float` | valeur monétaire, agrégations (`sum`, `avg`) |
+| `currency`, `country_code`, `status`, `reason`, `merchant` | `keyword` | valeurs catégorielles, filtrage/agrégation exacte (pas de full-text) |
+| `card_present` | `boolean` | comparaison directe CP / CNP, pas de parsing de chaîne |
+| `ip` (index `auth`) | `ip` | permet les requêtes par plage/sous-réseau (ex. `181.214.200.0/24`) |
+| `geoip.location` (index `auth`) | `geo_point` | requis pour la visualisation carte (app Maps) |
+| `@timestamp` | `date` | axe des séries temporelles, obligatoire pour tous les panels time-based |
+| `message` | `text` | seul champ en full-text, pour du debug/Discover — jamais utilisé pour filtrer/agréger |
+
+Tous les autres champs (`id`, `atm_id`, `city`, `op`, `result`, `user`,
+`channel`, `tags`…) suivent la même logique : `keyword` par défaut pour tout
+ce qui sert à filtrer ou grouper, jamais de mapping dynamique laissé au
+hasard sur les index métier (`dynamic: false`, voir section 4).
+
+## 7. L'alerte
+
+- **Type** : Kibana Alerting — règle "Elasticsearch query" (KQL).
+- **Data view** : `bank-txn`. **Requête** : `status: declined and card_present: false`.
+- **Condition** : `count() > 20` sur une fenêtre glissante de 5 minutes,
+  évaluée toutes les minutes.
+- **Action** : connecteur "Index" → écrit un document dans
+  `bank-transactions-alerts`.
+- **Preuve de déclenchement** : démontrée en conditions réelles (générateur
+  en mode continu) — voir rapport PDF pour la capture et le document JSON
+  indexé.
+
+## 8. Structure du dépôt
 
 ```
-team-<nom>/
-├── docker-compose.yml
-├── README.md
-├── kits/bank-transactions/{generator/generate.py, logs/, README.md}
-├── logstash/pipeline/bank-transactions.conf
-├── logstash/config/logstash.yml
-├── elasticsearch/mappings/*.json     # index templates
-├── kibana/dashboard.ndjson           # à exporter une fois le dashboard fini
-└── scripts/seed.sh                   # LA commande de seed
+team-bank-transactions/
+├── docker-compose.yml          # stack complète (ES + Kibana + Logstash)
+├── README.md                   # ce fichier
+├── docs/
+│   └── rapport-meridian-pay.pdf
+├── kits/bank-transactions/
+│   ├── generator/generate.py
+│   ├── logs/.gitkeep           # logs générés, ignorés par git
+│   └── README.md               # énoncé original du kit
+├── logstash/
+│   ├── pipeline/bank-transactions.conf
+│   └── config/logstash.yml
+├── elasticsearch/mappings/*.json   # 5 index templates
+├── kibana/dashboard.ndjson     # dashboard exporté (saved objects)
+└── scripts/
+    ├── seed.sh                 # LA commande de seed
+    └── verify_count.sh         # vérification du critère d'acceptation
 ```
 
-## 7. Checklist avant rendu
-
-- [ ] `docker compose up -d` + `scripts/seed.sh` sur une machine vierge → tout fonctionne
-- [ ] `(docs indexés) + (docs dead-letter) = N` vérifié pour un batch donné
-- [ ] mappings explicites confirmés via `GET <index>/_mapping`
-- [ ] dashboard `.ndjson` s'importe proprement et répond aux 8 questions
-- [ ] alerte démontrée (capture + live)
-- [ ] section "choix & compromis" rédigée avec nos vraies décisions
