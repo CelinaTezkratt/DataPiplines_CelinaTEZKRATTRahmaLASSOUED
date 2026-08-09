@@ -5,31 +5,41 @@ paiement fictif **Meridian Pay** : ingestion de 3 sources hétérogènes,
 stockage avec mappings explicites, dashboard répondant à 8 questions métier,
 et alerte temps réel sur un burst de fraude.
 
+Rapport complet: [`docs/rapport-meridian-pay.pdf`](docs/rapport-meridian-pay.pdf)
 
 ## 1. Architecture
 
-```
-générateur Python (fourni)
-        │  écrit
-        ▼
-kits/bank-transactions/logs/{transactions.log, auth.log, atm.csv}
-        │  lus par Logstash (file input, un input par source)
-        ▼
-Logstash — parse (kv / json / csv) — type — enrichit (geoip) — route
-        │                                                    │
-        ▼ (lignes valides)                                   ▼ (lignes malformées)
-Elasticsearch                                        Elasticsearch
-  bank-transactions-txn-*                               bank-transactions-deadletter-*
-  bank-transactions-auth-*
-  bank-transactions-atm-*
-        │
-        ▼
-Kibana — dashboard (8 questions) + règle d'alerte → bank-transactions-alerts
-```
+![Architecture de la chaîne de données](docs/architecture.png)
 
 La stack est entièrement conteneurisée (Docker Compose) : Elasticsearch 8.15,
 Kibana 8.15, Logstash 8.15, un réseau Docker, un volume persistant pour les
 données Elasticsearch.
+
+**Déroulé du pipeline, étape par étape :**
+
+1. **Génération** — le script Python fourni (`generate.py`) écrit les 3
+   sources brutes (`transactions.log`, `auth.log`, `atm.csv`) dans
+   `kits/bank-transactions/logs/`, avec ~2% de lignes volontairement
+   malformées.
+2. **Ingestion** — Logstash lit chaque fichier via un `file input` dédié
+   (un par source), pour pouvoir appliquer un traitement spécifique à
+   chacune.
+3. **Parsing** — chaque source suit un filtre adapté à son format :
+   `kv` (clé=valeur) pour les transactions, `json` pour l'authentification,
+   `csv` pour les distributeurs.
+4. **Typage** — les champs sont convertis vers leur type réel (`amount` en
+   `float`, `card_present` en `boolean`, dates en `date`…), voir la section
+   6 pour le détail du mapping.
+5. **Enrichissement** — un filtre `geoip` géolocalise le champ `ip` de
+   `auth.log`, pour permettre la carte des échecs d'authentification
+   (question 7).
+6. **Routage** — chaque ligne est aiguillée soit vers son index métier
+   (`bank-transactions-txn-*`, `-auth-*` ou `-atm-*`) si elle contient tous
+   les champs obligatoires, soit vers `bank-transactions-deadletter-*` sinon
+   — voir section 3 pour les bugs rencontrés sur ce routage.
+7. **Exploitation** — Kibana lit les index métier pour le dashboard (8
+   questions) et exécute la règle d'alerte, qui écrit dans
+   `bank-transactions-alerts` en cas de dépassement de seuil.
 
 ## 2. Comment lancer le projet
 
@@ -165,7 +175,7 @@ template au démarrage).
 
 | Champ | Type | Pourquoi |
 |-------|------|----------|
-|`amount`| `float` | valeur monétaire, agrégations (`sum`, `avg`) |
+| `amount` | `float` | valeur monétaire, agrégations (`sum`, `avg`) |
 | `currency`, `country_code`, `status`, `reason`, `merchant` | `keyword` | valeurs catégorielles, filtrage/agrégation exacte (pas de full-text) |
 | `card_present` | `boolean` | comparaison directe CP / CNP, pas de parsing de chaîne |
 | `ip` (index `auth`) | `ip` | permet les requêtes par plage/sous-réseau (ex. `181.214.200.0/24`) |
@@ -211,4 +221,3 @@ team-bank-transactions/
     ├── seed.sh                 # LA commande de seed
     └── verify_count.sh         # vérification du critère d'acceptation
 ```
-
